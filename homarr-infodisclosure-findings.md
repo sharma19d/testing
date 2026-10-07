@@ -81,5 +81,17 @@ When the default engine is integration-backed, the response includes `"integrati
 
 Both findings were verified by static analysis of the shipped 2.2.0 code paths (procedure auth level, DB column selection, anonymous WHERE/type filters, and absence of output-schema stripping). I did not stand up a live instance (requires a DB + full build); the maintainers' triager can confirm each instantly with the unauthenticated requests above (Finding 1 needs a public board; Finding 2 needs an integration-backed default search engine).
 
+## Scope & prior-art check (verified)
+
+**In scope.** Homarr's `SECURITY.md` treats something as a vulnerability if it "puts users or user data at risk" (criterion 1). Finding 1 exposes user PII (email); Finding 2 exposes instance/integration data (internal URL + service type). Both fit. Report channel: GitHub private advisory, or `homarr-labs@proton.me`.
+
+**Supported version.** Audited against **v2.2.0**, which is the latest stable release (tags top out at v2.2.0) — the only version the policy supports. Both vulnerable code paths also still exist on the unreleased `dev` HEAD (not an in-progress fix).
+
+**Not a duplicate.** Checked: all 9 published GitHub advisories; the CVE/advisory databases (NVD, OSV, GitHub Advisory DB); and the repo's issues/PRs (semantic + keyword). Neither endpoint appears.
+- The only documented unauthenticated info-disclosure is **CVE-2026-27796 / GHSA-m4vc-4prp-cvp7** — the `integration.all` endpoint, a *different* procedure, patched back in **1.54.0**.
+- Related issues #6608 (integration management-page authz), #6557 (custom-widget UNAUTHORIZED functional bug), #2076 (old private-board access) do **not** cover either of these.
+
+**Severity precedent (strengthens Finding 2).** CVE-2026-27796 — the *same data class* (unauthenticated disclosure of an integration's internal URL + service type) via a different endpoint — was assigned **CVSS 5.3 (Medium)**. Finding 2 exposes the same category of data, so a comparable rating is reasonable. Finding 1 (email only) is likely Low.
+
 ## Reporting path
-Per Homarr `SECURITY.md` (private GitHub advisory). Both share one root cause and can be filed as a single advisory with two instances. Not yet reported — submission left to you.
+Per Homarr `SECURITY.md` (private GitHub advisory, or `homarr-labs@proton.me`). Both share one root cause and can be filed as a single advisory with two instances. Not yet reported — submission left to you.
