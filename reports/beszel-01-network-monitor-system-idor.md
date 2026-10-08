@@ -19,13 +19,15 @@ The `network_monitors` collection — a newer feature (agent version gate `MinVe
 
 Result: an authenticated low-privilege user can create/modify network monitors on systems belonging to other tenants.
 
-## 2. Direct security impact (proven)
+## 2. Direct security impact
 
-- **Cross-tenant integrity violation.** The attacker injects or modifies a network-probe configuration on another tenant's system — tampering with the victim's monitoring. Because the monitor ID is a deterministic hash of `(system, target, protocol, port/server)`, an attacker who targets the same tuple as an existing victim monitor can collide its ID and overwrite/disrupt it (availability impact on the victim's monitoring).
-- **Weaponizing the victim's agent as a network probe.** The monitor's `target`/`protocol`/`port`/`server` are attacker-controlled. Once the monitor lives on the victim's system, Beszel pushes it to the **victim's agent**, which then performs the attacker-chosen TCP/HTTP/DNS/ICMP probe against an attacker-chosen target on the **victim's private network** (e.g. `169.254.169.254`, internal hosts/ports) — a blind SSRF/port-scan pivot through infrastructure the attacker does not control.
+Both halves of the attack chain are **verified with passing Go tests against the real code** (see §4), not inferred:
+
+- **Cross-tenant integrity violation (VERIFIED).** An authenticated low-privilege user injects/relocates a network-probe configuration onto another tenant's system. Test 1 proves a `network_monitors` row with the attacker's `target` ends up on a system the attacker is not a member of. Because the monitor ID is a deterministic hash of `(system, target, protocol, port/server)`, choosing the same tuple as an existing victim monitor collides its ID and overwrites/disrupts it (integrity/availability on the victim's monitoring).
+- **Weaponizing the victim's agent as a network probe (VERIFIED).** Test 2 proves that a monitor row on a system is pushed to that system's agent on connect (`GetMonitorConfigsForSystem` filters only `WHERE system=? AND enabled=true` — **no owner filter**), and the victim's agent is instructed to run the attacker-chosen TCP/HTTP/DNS/ICMP probe against an attacker-chosen target on the **victim's private network** (demonstrated with `169.254.169.254`, a cloud-metadata address). This is a probe-injection / port-scan pivot through infrastructure the attacker does not control.
 - Low privilege, no victim interaction.
 
-This is the same authorization-bypass class Beszel has already accepted and assigned CVEs for (CVE-2026-40077, CVE-2026-94382), extended to a newer endpoint with added integrity/availability impact.
+**Honest scope of impact (triager note).** After reassignment the monitor's `system` is the victim's, so the attacker **loses read access to the record and cannot read the probe results** — this is a *blind* probe injection plus integrity/availability tampering, not a results-exfiltrating SSRF. The confidentiality gain to the attacker is therefore low/none; the concrete impact is cross-tenant integrity + forcing the victim's agent to emit attacker-chosen network traffic. This is the same authorization-bypass class Beszel has already assigned CVEs for (CVE-2026-40077, CVE-2026-94382), on a newer endpoint.
 
 ## 3. Root cause (exact code)
 
@@ -63,19 +65,14 @@ hub.OnRecordUpdateRequest("network_monitors").BindFunc(func(e *core.RecordReques
 })
 ```
 
-## 4. Proof of Concept (verified, runs against the real hub)
+## 4. Proof of Concept (two passing tests against the real hub)
 
-The PoC is a Go test (`beszel-network-monitor-idor_test.go`) built on Beszel's own test harness, mirroring `alerts_access_test.go`. It creates two users (attacker, victim) each owning a system, has the attacker create a monitor on their own system, then `PATCH`es the monitor's `system` to the victim's system, and checks the database.
+Both PoCs are Go tests built on Beszel's own `//go:build testing` harness. A placeholder `internal/site/dist/index.html` is needed so the frontend embed compiles. Run with `SHARE_ALL_SYSTEMS=false` (the default).
 
-Run:
+**Test 1 — the IDOR itself** (`beszel-network-monitor-idor_test.go` → `internal/alerts/`): two users each own a system; the attacker creates a monitor on their own system, then `PATCH`es its `system` to the victim's system.
 ```
-# place the file at internal/alerts/nm_idor_poc_test.go in a beszel checkout
-# (needs a placeholder internal/site/dist/index.html so the frontend embed compiles)
 go test -tags testing -run TestNetworkMonitorSystemAccessIDOR_PoC ./internal/alerts/ -v
-```
 
-Actual output against Beszel 0.21.0 (`SHARE_ALL_SYSTEMS=false`):
-```
 === RUN   TestNetworkMonitorSystemAccessIDOR_PoC
     attacker created monitor 457f9a19 on own system cazc4i9di9l615j
     PATCH {system: victimSystem} -> HTTP 200:
@@ -84,7 +81,20 @@ Actual output against Beszel 0.21.0 (`SHARE_ALL_SYSTEMS=false`):
 --- FAIL: TestNetworkMonitorSystemAccessIDOR_PoC (0.48s)
         SECURE EXPECTATION: no monitor should exist on the victim's system
 ```
-The test asserts the *secure* expectation (no monitor on the victim's system); its failure is the proof that the IDOR succeeds. The identical operation against the `alerts` collection returns HTTP 404 (asserted by the project's own `alerts_access_test.go`), confirming the missing guard is specific to `network_monitors`.
+The test asserts the *secure* expectation (no monitor on the victim's system); its failure is the proof the IDOR succeeds. The identical operation on `alerts` returns HTTP 404 (asserted by the project's own `alerts_access_test.go`), confirming the missing guard is specific to `network_monitors`.
+
+**Test 2 — the downstream impact** (`beszel-network-monitor-idor-dispatch_test.go` → `internal/hub/systems/`): the row the IDOR produces is placed on a victim system whose agent then connects (mock agent from the project's own `network_monitor_sync_test.go` harness), and we assert what the hub sends the agent.
+```
+go test -tags testing -run TestNetworkMonitorIDOR_ReachesVictimAgent_PoC ./internal/hub/systems/ -v
+
+=== RUN   TestNetworkMonitorIDOR_ReachesVictimAgent_PoC
+    >>> IMPACT CONFIRMED: victim agent for system cxiw9tj87eusgsb was instructed to probe
+        "169.254.169.254" (tcp:80) — an attacker-controlled target injected via the network_monitors IDOR
+--- PASS: TestNetworkMonitorIDOR_ReachesVictimAgent_PoC (0.21s)
+PASS
+```
+
+Together these prove the complete chain: attacker injects a probe onto a system they don't own → the victim's agent is told to execute that attacker-chosen probe. The connecting production query `GetMonitorConfigsForSystem` (`SELECT ... FROM network_monitors WHERE system = ? AND enabled = true`) applies no ownership filter, so the injected row is included.
 
 ## 5. Remediation
 
